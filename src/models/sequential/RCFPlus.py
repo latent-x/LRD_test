@@ -10,6 +10,7 @@ from utils import layers
 from models.BaseModel import SequentialModel
 from helpers.DFTReader import DFTReader
 from helpers.KGReader import KGReader
+import torch.nn.functional as F
 
 
 class RCFPlus(SequentialModel):
@@ -52,6 +53,10 @@ class RCFPlus(SequentialModel):
                             help='Whether include Knowledge Graph Embedding module')
         parser.add_argument('--message', type=str, default="",
                             help='additional message')
+        parser.add_argument('--kg_embedding', type=str, default="distmult",
+                            help='knowledge graph embedding type')
+        parser.add_argument('--gnn_usage', type=str, default="False",
+                            help='usage of gnn for knowledge graph')
         return SequentialModel.parse_model_args(parser)
 
     def __init__(self, args, corpus):
@@ -75,6 +80,8 @@ class RCFPlus(SequentialModel):
         self.include_lrd = args.include_lrd
         self.include_kge = args.include_kge
         self.only_predict = args.only_predict
+        self.kg_embedding = args.kg_embedding
+        self.gnn_usage = args.gnn_usage
         if self.gamma < 0:
             self.gamma = len(corpus.relation_df) / len(corpus.all_df)
         super().__init__(args, corpus)
@@ -126,6 +133,7 @@ class RCFPlus(SequentialModel):
 
     def forward(self, feed_dict):
         self.check_list = []
+        
         if self.only_predict:
             prediction, his_i_ids, target_attention = self.rec_forward(feed_dict)
             out_dict = {'prediction': prediction, "his_i_ids": his_i_ids, "target_attention": target_attention}
@@ -142,13 +150,82 @@ class RCFPlus(SequentialModel):
         return out_dict
 
     def get_triple_score(self, his_vectors,w_r_vectors, i_vectors):
-        triple_score_1 = (his_vectors[:, :, None, :] * w_r_vectors)  # B * H * R * V
-        triple_score_1 = (triple_score_1 * i_vectors[:, None, None, :]).sum(-1)  # B * H * R
-        triple_score_2 = (his_vectors[:, :, None, :] * w_r_vectors).sum(-1)  # B * H * R
-        triple_score_3 = (i_vectors[:, None, None, :] * w_r_vectors).sum(-1)  # B * H * R
-        triple_score = triple_score_1 + triple_score_2 + triple_score_3  # B * H * R
+        if self.kg_embedding == 'distmult':
+            triple_score_1 = (his_vectors[:, :, None, :] * w_r_vectors)  # B * H * R * V
+            triple_score_1 = (triple_score_1 * i_vectors[:, None, None, :]).sum(-1)  # B * H * R
+            triple_score_2 = (his_vectors[:, :, None, :] * w_r_vectors).sum(-1)  # B * H * R
+            triple_score_3 = (i_vectors[:, None, None, :] * w_r_vectors).sum(-1)  # B * H * R
+            triple_score = triple_score_1 + triple_score_2 + triple_score_3  # B * H * R
+            
+            return triple_score
+            
+        elif self.kg_embedding == 'complex':
+            # split into real and imag parts
+            h_re, h_im = his_vectors[..., :self.emb_size//2], his_vectors[..., self.emb_size//2:]  # B x H x V
+            r_re, r_im = w_r_vectors[..., :self.emb_size//2], w_r_vectors[..., self.emb_size//2:]  # B x H x R x V
+            t_re, t_im = i_vectors[..., :self.emb_size//2], i_vectors[..., self.emb_size//2:]      # B x V
+        
+            # reshape tail to match broadcast dims
+            t_re = t_re[:, None, None, :]  # B x 1 x 1 x V
+            t_im = t_im[:, None, None, :]  # B x 1 x 1 x V
+        
+            # ComplEx score
+            score = (
+                (h_re[:, :, None, :] * r_re * t_re).sum(-1) +   # Re * Re * Re
+                (h_im[:, :, None, :] * r_re * t_im).sum(-1) +   # Im * Re * Im
+                (h_re[:, :, None, :] * r_im * t_im).sum(-1) -   # Re * Im * Im
+                (h_im[:, :, None, :] * r_im * t_re).sum(-1)     # - Im * Im * Re
+            )
+            
+            triple_score_2 = (his_vectors[:, :, None, :] * w_r_vectors).sum(-1)  # B * H * R
+            triple_score_3 = (i_vectors[:, None, None, :] * w_r_vectors).sum(-1)  # B * H * R
+        
+            return score + triple_score_2 + triple_score_3  # B x H x R
+        
+        elif self.kg_embedding == 'rotate':
+            emb_dim = self.emb_size // 2
+            pi = 3.141592653589793
+        
+            # split real/imag for head, tail
+            h_re, h_im = his_vectors[..., :emb_dim], his_vectors[..., emb_dim:]  # B x H x V
+            t_re, t_im = i_vectors[..., :emb_dim], i_vectors[..., emb_dim:]      # B x V
+            
+            # relation: use w_r_vectors[..., :emb_dim] as phase
+            phase = w_r_vectors[..., :emb_dim]  # B x H x R x V
+            # phase = phase % (2 * pi) - pi
+        
+            r_re = torch.cos(phase)
+            r_im = torch.sin(phase)
+        
+            # rotate head
+            rot_h_re = h_re[:, :, None, :] * r_re - h_im[:, :, None, :] * r_im  # B x H x R x V
+            rot_h_im = h_re[:, :, None, :] * r_im + h_im[:, :, None, :] * r_re
+        
+            # broadcast tail
+            t_re = t_re[:, None, None, :]  # B x 1 x 1 x V
+            t_im = t_im[:, None, None, :]  # B x 1 x 1 x V
+        
+            re_diff = rot_h_re - t_re
+            im_diff = rot_h_im - t_im
+        
+            # L2 distance in complex plane
+            score = torch.stack([re_diff, im_diff], dim=-1).norm(p=2, dim=-1).sum(-1)  # B x H x R
+            
+            # auxiliary cosine similarity between rotated head and tail
+            # rot_h = torch.cat([rot_h_re, rot_h_im], dim = -1)
+            # t_vec = torch.cat([t_re, t_im], dim = -1)
+            
+            # rot_h = F.normalize(rot_h, p=2, dim=-1)
+            # t_vec = F.normalize(t_vec, p=2, dim=-1)
+            # aux_score = (rot_h * t_vec).sum(-1)
+       
+            # return -score + aux_score
+            return -score
+            
+        else:
+            raise ValueError(f"Unknown kg_embedding: {self.kg_embedding}")
 
-        return triple_score
+        
 
     def lrd_predict(self, feed_dict):
         i_ids = feed_dict['item_id'][:,0]  # B
@@ -281,10 +358,62 @@ class RCFPlus(SequentialModel):
         relation_vectors = self.relation_embeddings(relation_ids)
 
         # DistMult
-        if self.include_val:
-            prediction = (head_vectors * (relation_vectors + value_vectors)[:, None, :] * tail_vectors).sum(-1)
+        if self.kg_embedding == 'distmult':
+            if self.include_val:
+                prediction = (head_vectors * (relation_vectors + value_vectors)[:, None, :] * tail_vectors).sum(-1)
+            else:
+                prediction = (head_vectors * relation_vectors[:, None, :] * tail_vectors).sum(-1)
+        elif self.kg_embedding == 'complex':
+            if self.include_val:
+                relation_vectors = relation_vectors + value_vectors  # B x 2V
+    
+            # Split real and imaginary parts
+            emb_dim = self.emb_size // 2  # V
+            h_re, h_im = head_vectors[..., :emb_dim], head_vectors[..., emb_dim:]
+            t_re, t_im = tail_vectors[..., :emb_dim], tail_vectors[..., emb_dim:]
+            r_re, r_im = relation_vectors[..., :emb_dim], relation_vectors[..., emb_dim:]
+    
+            # reshape r for broadcasting
+            r_re = r_re.unsqueeze(1)  # B x 1 x V
+            r_im = r_im.unsqueeze(1)
+    
+            # ComplEx score
+            prediction = (
+                h_re * r_re * t_re +
+                h_im * r_re * t_im +
+                h_re * r_im * t_im -
+                h_im * r_im * t_re
+            ).sum(dim=-1)  # B x ?
+        elif self.kg_embedding == 'rotate':
+            if self.include_val:
+                relation_vectors = relation_vectors + value_vectors
+            
+            emb_dim = self.emb_size // 2
+            pi = 3.141592653
+            
+            # real/img
+            h_re, h_im = head_vectors[..., :emb_dim], head_vectors[..., emb_dim:]
+            t_re, t_im = tail_vectors[..., :emb_dim], tail_vectors[..., emb_dim:]
+            
+            phase = relation_vectors[..., :emb_dim]
+            # phase = phase % (2 * pi) - pi
+            
+            r_re, r_im = torch.cos(phase), torch.sin(phase) # B x V
+            r_re = r_re.unsqueeze(1)
+            r_im = r_im.unsqueeze(1)
+            
+            rot_h_re = h_re * r_re - h_im * r_im
+            rot_h_im = h_re * r_im + h_im * r_re
+            
+            # distance
+            re_diff = rot_h_re - t_re
+            im_diff = rot_h_im - t_im
+            score = torch.stack([re_diff, im_diff], dim=-1).norm(p=2, dim=-1)
+            prediction = -score.sum(dim=-1)
+            
         else:
-            prediction = (head_vectors * relation_vectors[:, None, :] * tail_vectors).sum(-1)
+            raise ValueError(f"Unknown kg_embedding: {self.kg_embedding}")
+        
         return prediction
 
     def loss(self, out_dict):
